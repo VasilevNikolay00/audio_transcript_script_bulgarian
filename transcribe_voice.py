@@ -1,232 +1,239 @@
 import os
+import gc
+import sys
+import torch
 import warnings
+import whisperx
+from pathlib import Path
+from whisperx.diarize import DiarizationPipeline
 
-# --- Must be before ANY other imports ---
+# --- 1. System & Performance Tweaks ---
 os.environ["KMP_WARNINGS"] = "0"
 os.environ["PYTHONWARNINGS"] = "ignore"
 warnings.filterwarnings("ignore")
 
-import gc
-import torch
-
+# Enable Tensor Cores for NVIDIA GPUs (Optimizes speed on RTX cards)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-import whisperx
-import sys
-from whisperx.diarize import DiarizationPipeline
-from pathlib import Path
-
-
 # ---------------------------------------------------------------------------
-# .env loader (no external deps — works without python-dotenv installed)
+# Robust .env Loader
 # ---------------------------------------------------------------------------
-def load_env_file(env_path: str = ".env"):
-    """Load key=value pairs from a .env file into os.environ."""
-    path = Path(env_path)
-    if not path.exists():
+def load_env():
+    """Manually load .env and clean values to prevent 'Empty string' errors."""
+    env_path = Path(".env")
+    if not env_path.exists():
         return
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            # Only set if not already present in the environment
-            if key and key not in os.environ:
-                os.environ[key] = value
+    
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        val = value.strip().strip('"').strip("'")
+        os.environ[key] = val
 
-
-load_env_file(".env")
+load_env()
 
 # ---------------------------------------------------------------------------
-# Config — read from environment (populated from .env above)
+# Core Transcriber Class
 # ---------------------------------------------------------------------------
-HF_TOKEN       = os.environ.get("HF_TOKEN", "")
-WHISPER_MODEL  = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
-ALIGN_MODEL    = os.environ.get("ALIGN_MODEL", "infinitejoy/wav2vec2-large-xls-r-300m-bulgarian")
-LANGUAGE       = os.environ.get("LANGUAGE", "bg") or "bg"   # guard against empty string
-OUTPUT_FILE    = os.environ.get("OUTPUT_FILE", "transcript.txt")
-MIN_SPEAKERS   = int(os.environ.get("MIN_SPEAKERS", "1"))
-MAX_SPEAKERS   = int(os.environ.get("MAX_SPEAKERS", "10"))
-BATCH_SIZE_GPU = int(os.environ.get("BATCH_SIZE_GPU", "16"))
-BATCH_SIZE_CPU = int(os.environ.get("BATCH_SIZE_CPU", "4"))
+class Transcriber:
+    def __init__(self):
+        # 1. Device detection
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # 2. Compute Type
+        raw_compute = os.environ.get("COMPUTE_TYPE", "").strip()
+        if not raw_compute:
+            self.compute_type = "float16" if self.device == "cuda" else "int8"
+        else:
+            self.compute_type = raw_compute
 
-_compute_type_env  = os.environ.get("COMPUTE_TYPE", "").strip()
-_num_speakers_env  = os.environ.get("NUM_SPEAKERS", "").strip()
-NUM_SPEAKERS_DEFAULT = int(_num_speakers_env) if _num_speakers_env else None
+        # 3. Model & Language
+        # .env uses WHISPER_MODEL=turbo → WhisperX expects "large-v3-turbo"
+        _model_raw = os.environ.get("WHISPER_MODEL", "large-v3-turbo").strip()
+        self.model_name = "large-v3-turbo" if _model_raw == "turbo" else (_model_raw or "large-v3-turbo")
 
-if not HF_TOKEN:
-    raise EnvironmentError(
-        "HF_TOKEN is not set.\n"
-        "Add it to your .env file or run: export HF_TOKEN='hf_...'"
-    )
+        # ALIGN_MODEL: optional custom HuggingFace model for alignment
+        self.align_model = os.environ.get("ALIGN_MODEL", "").strip() or None
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+        self.lang = os.environ.get("LANGUAGE", "bg").strip() or "bg"
+        self.hf_token = os.environ.get("HF_TOKEN", "").strip()
 
-def format_timestamp(seconds: float) -> str:
-    if seconds is None:
-        return "[00:00]"
-    m, s = divmod(int(seconds), 60)
-    return f"[{m:02d}:{s:02d}]"
+        # NUM_SPEAKERS: if set, fixes exact speaker count for diarization
+        _num_s = os.environ.get("NUM_SPEAKERS", "").strip()
+        self.num_speakers = int(_num_s) if _num_s else None
 
+        # 4. Batch Sizes
+        if self.device == "cuda":
+            self.batch_size = int(os.environ.get("BATCH_SIZE_GPU", "16"))
+        else:
+            self.batch_size = int(os.environ.get("BATCH_SIZE_CPU", "4"))
 
-def resolve_compute_type(device: str) -> str:
-    if _compute_type_env:
-        return _compute_type_env
-    return "float16" if device == "cuda" else "int8"
+        print(f"--- Initialization ---")
+        print(f"  Device      : {self.device}")
+        print(f"  Compute     : {self.compute_type}")
+        print(f"  Model       : {self.model_name}")
+        print(f"  Align Model : {self.align_model or '(auto)'}")
+        print(f"  Language    : {self.lang}")
+        print(f"  Batch Size  : {self.batch_size}")
+        print(f"  Speakers    : {self.num_speakers or 'auto'}")
+        print(f"----------------------\n")
 
-
-# ---------------------------------------------------------------------------
-# Core pipeline
-# ---------------------------------------------------------------------------
-
-def transcribe_and_diarize(audio_file_path: str, num_speakers: int = None):
-    device       = "cuda" if torch.cuda.is_available() else "cpu"
-    compute_type = resolve_compute_type(device)
-    batch_size   = BATCH_SIZE_GPU if device == "cuda" else BATCH_SIZE_CPU
-
-    if num_speakers is None:
-        num_speakers = NUM_SPEAKERS_DEFAULT
-
-    print(f"--- Config ---")
-    print(f"  device       : {device} ({compute_type})")
-    print(f"  whisper model: {WHISPER_MODEL}")
-    print(f"  align model  : {ALIGN_MODEL}")
-    print(f"  language     : {LANGUAGE}")
-    print(f"  batch size   : {batch_size}")
-    print(f"  num_speakers : {num_speakers if num_speakers else 'auto'}")
-    print(f"  TF32         : enabled")
-    print()
-
-    # 1. Load audio
-    audio = whisperx.load_audio(audio_file_path)
-
-    # 2. Transcribe
-    print(f"--- Step 1: Transcribing ({WHISPER_MODEL}) ---")
-    model = whisperx.load_model(WHISPER_MODEL, device, compute_type=compute_type)
-    result = model.transcribe(audio, batch_size=batch_size, language=LANGUAGE)
-    del model
-    gc.collect()
-    if device == "cuda":
-        torch.cuda.empty_cache()
-
-    # 3. Align (word-level timestamps)
-    print(f"--- Step 2: Aligning ({ALIGN_MODEL}) ---")
-    try:
-        model_a, metadata = whisperx.load_align_model(
-            language_code=LANGUAGE,
-            device=device,
-            model_name=ALIGN_MODEL,
-        )
-        result = whisperx.align(result["segments"], model_a, metadata, audio, device)
-        del model_a
+    def _flush(self):
+        """Force garbage collection to prevent VRAM overflow."""
         gc.collect()
-        if device == "cuda":
+        if self.device == "cuda":
             torch.cuda.empty_cache()
-    except Exception as e:
-        print(f"Alignment error (continuing without it): {e}")
-        if "segments" not in result:
-            result = {"segments": result}
 
-    # 4. Diarize
-    print("--- Step 3: Diarizing ---")
-    try:
-        diarize_model = DiarizationPipeline(token=HF_TOKEN, device=device)
+    def load_wordlists(self, folder="wordlists"):
+        """Reads all .txt files to build a vocabulary prompt for higher accuracy."""
+        words = []
+        path = Path(folder)
+        if path.exists() and path.is_dir():
+            for f in path.glob("*.txt"):
+                with open(f, "r", encoding="utf-8") as file:
+                    words.extend([line.strip() for line in file if line.strip()])
+        
+        if not words:
+            return None
+        
+        prompt = "Това е разговор на български език. Ключови думи: " + ", ".join(list(set(words)))
+        return prompt[:800]
 
-        if num_speakers is not None:
-            diarize_segments = diarize_model(
+    @torch.inference_mode()
+    def run(self, audio_path, num_speakers=None):
+        print(f"Processing: {audio_path}")
+        audio = whisperx.load_audio(audio_path)
+        initial_prompt = None
+
+        # --- STEP 1: TRANSCRIPTION ---
+        print(f"-> Phase 1: Transcribing (Accurate Mode)...")
+
+        # WhisperX requires initial_prompt and beam_size inside asr_options at
+        # load_model time — passing them to transcribe() is silently ignored.
+        asr_options = {"beam_size": 10}
+        if initial_prompt:
+            asr_options["initial_prompt"] = initial_prompt
+
+        model = whisperx.load_model(
+            self.model_name,
+            self.device,
+            compute_type=self.compute_type,
+            asr_options=asr_options,
+        )
+
+        result = model.transcribe(
+            audio,
+            batch_size=self.batch_size,
+            language=self.lang,
+        )
+
+        del model
+        self._flush()
+
+        # --- STEP 2: ALIGNMENT ---
+        print("-> Phase 2: Aligning word timestamps...")
+        try:
+            # Use ALIGN_MODEL from .env if provided, otherwise let WhisperX auto-select
+            align_kwargs = {"language_code": self.lang, "device": self.device}
+            if self.align_model:
+                align_kwargs["model_name"] = self.align_model
+
+            model_a, metadata = whisperx.load_align_model(**align_kwargs)
+            result = whisperx.align(
+                result["segments"],
+                model_a,
+                metadata,
                 audio,
-                min_speakers=num_speakers,
-                max_speakers=num_speakers,
+                self.device,
+                return_char_alignments=False,
             )
-        else:
-            diarize_segments = diarize_model(
-                audio,
-                min_speakers=MIN_SPEAKERS,
-                max_speakers=MAX_SPEAKERS,
-            )
+            del model_a
+            self._flush()
+        except Exception as e:
+            print(f"   [!] Alignment skipped: {e}")
 
-        result = whisperx.assign_word_speakers(diarize_segments, result)
-    except Exception as e:
-        print(f"Diarization failed: {e}")
+        # --- STEP 3: DIARIZATION ---
+        print("-> Phase 3: Diarizing speakers...")
+        if not self.hf_token:
+            print("   [!] HF_TOKEN missing. Skipping diarization.")
+            return result["segments"]
 
-    return result.get("segments", result)
+        try:
+            diarize_model = DiarizationPipeline(token=self.hf_token, device=self.device)
 
+            # CLI arg takes priority over .env NUM_SPEAKERS; fall back to min/max range
+            fixed = num_speakers or self.num_speakers
+            if fixed:
+                min_s = max_s = fixed
+            else:
+                min_s = int(os.environ.get("MIN_SPEAKERS", "1"))
+                max_s = int(os.environ.get("MAX_SPEAKERS", "10"))
 
-# ---------------------------------------------------------------------------
-# Transcript formatter
-# ---------------------------------------------------------------------------
+            diarize_segments = diarize_model(audio, min_speakers=min_s, max_speakers=max_s)
+            result = whisperx.assign_word_speakers(diarize_segments, result)
+            del diarize_model
+            self._flush()
+        except Exception as e:
+            print(f"   [!] Diarization failed: {e}")
 
-def build_transcript(segments: list) -> str:
-    final_output = ""
-    current_speaker = None
+        return result["segments"]
 
-    for seg in segments:
-        if "words" in seg and seg["words"]:
-            for word in seg["words"]:
-                speaker    = word.get("speaker", "UNKNOWN")
-                text       = word.get("word", "").strip()
-                start_time = word.get("start")
+    def format_transcript(self, segments):
+        """Converts segment data into clean readable text."""
+        output = []
+        current_speaker = None
 
-                if not text:
-                    continue
-
-                if speaker != current_speaker:
-                    time_str = format_timestamp(start_time)
-                    final_output += f"\n{time_str} {speaker}: "
-                    current_speaker = speaker
-
-                final_output += f"{text} "
-        else:
+        for seg in segments:
             speaker = seg.get("speaker", "UNKNOWN")
-            text    = seg.get("text", "").strip()
-            if not text:
-                continue
+            
             if speaker != current_speaker:
-                final_output += f"\n{format_timestamp(seg.get('start'))} {speaker}: "
+                start_t = seg.get("start", 0)
+                m, s = divmod(int(start_t), 60)
+                output.append(f"\n[{m:02d}:{s:02d}] {speaker}: ")
                 current_speaker = speaker
-            final_output += f"{text} "
+            
+            text = seg.get("text", "").strip()
+            output.append(f"{text} ")
 
-    return final_output.strip()
-
+        return "".join(output).strip()
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Main Execution
 # ---------------------------------------------------------------------------
-
 def main():
     if len(sys.argv) < 2:
         print("Usage: python transcribe_voice.py <audio_file> [num_speakers]")
-        print("  num_speakers (optional): overrides NUM_SPEAKERS in .env")
         return
 
-    audio_path   = sys.argv[1]
-    num_speakers = int(sys.argv[2]) if len(sys.argv) >= 3 else None
-
-    if not os.path.exists(audio_path):
-        print(f"Error: File not found: {audio_path}")
+    audio_file = sys.argv[1]
+    num_speakers = int(sys.argv[2]) if len(sys.argv) > 2 else None
+    
+    if not os.path.exists(audio_file):
+        print(f"Error: File not found: {audio_file}")
         return
 
+    engine = Transcriber()
     try:
-        segments   = transcribe_and_diarize(audio_path, num_speakers=num_speakers)
-
-        print("\n" + "=" * 20 + " FINAL TRANSCRIPT " + "=" * 20)
-        transcript = build_transcript(segments)
+        segments = engine.run(audio_file, num_speakers)
+        transcript = engine.format_transcript(segments)
+        
+        print("\n" + "="*20 + " TRANSCRIPT " + "="*20)
         print(transcript)
-
-        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        
+        out_path = os.environ.get("OUTPUT_FILE", "transcript.txt")
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(out_path, "w", encoding="utf-8") as f:
             f.write(transcript)
-        print(f"\nTranscript saved to: {OUTPUT_FILE}")
+        print(f"\nSaved to: {out_path}")
 
     except Exception as e:
-        print(f"Fatal error: {e}")
-        raise
-
+        print(f"\nFATAL ERROR: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
