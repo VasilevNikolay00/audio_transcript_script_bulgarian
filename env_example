@@ -1,0 +1,26 @@
+# Hugging Face Token (required for diarization)
+HF_TOKEN=
+
+# Whisper model: tiny, base, small, medium, large-v2, large-v3, large-v3-turbo
+WHISPER_MODEL=large-v3-turbo
+
+# Alignment model
+ALIGN_MODEL=infinitejoy/wav2vec2-large-xls-r-300m-bulgarian
+
+# Language
+LANGUAGE=bg
+
+# Compute type: float16 (GPU), int8 (CPU), float32 — leave blank to auto-detect
+COMPUTE_TYPE= 
+
+# Batch sizes
+BATCH_SIZE_GPU=16
+BATCH_SIZE_CPU=4
+
+# Speaker diarization — set NUM_SPEAKERS to fix exact count, or leave blank for auto
+NUM_SPEAKERS=
+MIN_SPEAKERS=1
+MAX_SPEAKERS=10
+
+# Output
+OUTPUT_FILE=output/transcript.txt
