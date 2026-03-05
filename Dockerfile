@@ -16,16 +16,18 @@ RUN pip install --no-cache-dir \
     git+https://github.com/m-bain/whisperx.git
 
 ARG HF_TOKEN
+ARG WHISPER_MODEL
+ARG WAV2VEC2_MODEL
 
 RUN python -c "\
 import whisperx; \
-whisperx.load_model('large-v3-turbo', 'cpu', compute_type='int8'); \
+whisperx.load_model('${WHISPER_MODEL}', 'cpu', compute_type='int8'); \
 print('Whisper model cached.')"
 
 RUN python -c "\
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor; \
-Wav2Vec2ForCTC.from_pretrained('infinitejoy/wav2vec2-large-xls-r-300m-bulgarian'); \
-Wav2Vec2Processor.from_pretrained('infinitejoy/wav2vec2-large-xls-r-300m-bulgarian'); \
+Wav2Vec2ForCTC.from_pretrained('${WAV2VEC2_MODEL}'); \
+Wav2Vec2Processor.from_pretrained('${WAV2VEC2_MODEL}'); \
 print('Alignment model cached.')"
 
 RUN python -c "\
