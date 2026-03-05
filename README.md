@@ -1,7 +1,10 @@
 Python 3.12 
 
 
-docker build --no-cache -t voice_transcriber:latest .
+docker build --no-cache \
+  --build-arg HF_TOKEN=$(grep HF_TOKEN .env | cut -d '=' -f2) \
+  -t voice_transcriber:latest .
+
 
 docker run --rm --gpus all \
   --env-file .env \
