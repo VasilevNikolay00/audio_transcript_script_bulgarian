@@ -15,5 +15,4 @@ docker run --rm --gpus all \
   -v $(pwd)/audio_data:/app/audio_data \
   -v $(pwd)/output:/app/output \
   voice_transcriber:latest \
-  audio_data/video.mp4
-
+  audio_data/{the audio/video file}
